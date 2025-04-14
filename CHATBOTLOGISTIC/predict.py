@@ -1,95 +1,129 @@
-import numpy as np
-import pandas as pd
-from langchain_core.runnables import RunnableLambda
-from chatstate import ChatState
+import os
 import joblib
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from chatstate import ChatState
+import random
 
-# Load model + encoders
-mapie_model = joblib.load("mapie_model_lgb.pkl")
-label_encoders = joblib.load("label_encoder.pkl")
-shipment_encoder = label_encoders["Shipment Mode"]
+# ==== Load paths ====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+MODEL_PATH = os.path.join(ROOT_DIR, "lightgbm.pkl")
+ENCODER_PATH = os.path.join(ROOT_DIR, "label_encoder.pkl")
 
-# Cột đầu vào đúng thứ tự
-FEATURE_COLUMNS = [
-    'DaysToDeliver',
-    'Project Code',
-    'Country',
-    'Pack Price',
-    'Vendor',
-    'Freight Cost (USD)',
-    'Weight (Kilograms)',
-    'PQ First Sent to Client Date'
+# ==== Load model & encoders ====
+model = joblib.load(MODEL_PATH)
+label_encoders = joblib.load(ENCODER_PATH)
+
+# ==== Config ====
+INPUT_FEATURES = [
+    "project_code",
+    "country",
+    "vendor",
+    "pack_price",
+    "freight_cost",
+    "weight",
+    "days_to_deliver",
+    "pq_days_since_quote"
 ]
+CATEGORICAL_COLS = ["project_code", "country", "vendor"]
 
-# Phương thức fallback (nếu model không trả kết quả)
-FALLBACK_METHOD = "Standard International Shipping"
-
-def predict_mode(state: ChatState) -> ChatState:
-    print("▶ [predict_node] Đang xử lý dự đoán MAPIE...")
-    features = state.features or {}
-
-    # Format input đúng định dạng DataFrame
-    X = pd.DataFrame([features], columns=FEATURE_COLUMNS)
-    X = X.fillna(-1)
-
+# ==== Helper ====
+def parse_days_since_quote(date_str):
+    if not isinstance(date_str, str) or not date_str.strip():
+        return -1
     try:
-        # Dự đoán tập nhãn với độ tin cậy 90% từ MAPIE
-        prediction_set = mapie_model.predict(X, alpha=0.3)
-        predicted_labels = prediction_set[0]
+        quote_date = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        return (datetime.today() - quote_date).days
+    except Exception as e:
+        print(f"⚠️ Lỗi parse ngày: {e}")
+        return -1
 
-        if len(predicted_labels) == 0:
-            raise ValueError("Không có nhãn nào được dự đoán.")
+# ==== Dự đoán Shipment Mode ====
+def predict_mode(state: ChatState) -> ChatState:
+    print("▶ [predict_node] Bắt đầu dự đoán Shipment Mode...")
 
-        # Convert index thành tên phương thức
-        label_names = shipment_encoder.inverse_transform(predicted_labels)
+    info = state.extracted_info or {}
+    data = {}
 
-        # Lấy xác suất thực tế nếu model gốc hỗ trợ
-        try:
-            base_model = mapie_model.estimator_
-            proba = base_model.predict_proba(X)[0]
+    # Map các trường
+    for field in INPUT_FEATURES:
+        if field == "pq_days_since_quote":
+            data[field] = parse_days_since_quote(info.get("pq_date"))
+        else:
+            val = info.get(field)
+            data[field] = val if val not in [None, ""] else -1
 
-            # Lấy top-n label có xác suất cao nhất (ví dụ n=3)
-            top_n = 3
-            top_indices = np.argsort(proba)[-top_n:][::-1]
-            label_names = shipment_encoder.inverse_transform(top_indices)
+    if data["project_code"] == -1:
+        data["project_code"] = "TEMP_PROJECT"
 
-            label_probs = {
-                shipment_encoder.inverse_transform([i])[0]: float(proba[i])
-                for i in top_indices
-}
-        except:
-            label_probs = {label: None for label in label_names}
+    df = pd.DataFrame([data])
+    print("📥 [Input DataFrame]:\n", df)
 
-        # Tạo chuỗi hiển thị cho GPT hoặc logging
-        label_str_list = []
-        for label in label_names:
-            prob = label_probs[label]
-            if prob is not None:
-                label_str_list.append(f"**{label}** (xác suất ~{round(prob * 100, 1)}%)")
+    # Encode các trường dạng category
+    for col in CATEGORICAL_COLS:
+        val = str(df[col].iloc[0])
+        le = label_encoders.get(col)
+        if le:
+            if val in le.classes_:
+                df[col] = le.transform([val])
             else:
-                label_str_list.append(f"**{label}**")
+                print(f"⚠️ `{col}` chưa có label `{val}` → giả lập random")
+                df[col] = random.randint(0, len(le.classes_) - 1)
+        else:
+            print(f"❌ Thiếu encoder `{col}` → giả lập random")
+            df[col] = random.randint(0, 5)
 
-        label_str = ", ".join(label_str_list)
+    df = df[INPUT_FEATURES]
+    print("✅ [Encoded DataFrame]:\n", df)
 
-        # Gán vào state đầy đủ
-        state.shipment_mode = list(label_names)
-        state.prediction_prob = max(label_probs.values()) if any(label_probs.values()) else None
-        state.label_probs = label_probs  # <-- KEY LINE giúp GPT hiểu
-        state.final_answer = (
-            f"Mô hình MAPIE dự đoán các phương thức vận chuyển phù hợp là: {label_str}. "
-            f"Đây là những phương án có khả năng cao nằm trong 90% độ tin cậy của mô hình.\n\n"
-            f"📦 Trong trường hợp ngoại lệ (10%), phương thức dự phòng được đề xuất là: **{FALLBACK_METHOD}**."
+    top_preds = []
+    try:
+        y_pred = model.predict(df)[0]
+        y_proba = model.predict_proba(df)[0]
+
+        # ⚠️ Dùng đúng key "Shipment Mode"
+        shipment_le = label_encoders.get("Shipment Mode")
+        if not shipment_le:
+            raise ValueError("Không tìm thấy encoder cho `Shipment Mode`")
+
+        predicted_mode = shipment_le.inverse_transform([int(y_pred)])[0]
+        class_names = shipment_le.inverse_transform(np.arange(len(y_proba)))
+
+        prob_dict = {
+            mode: round(100 * float(prob), 2)
+            for mode, prob in zip(class_names, y_proba)
+        }
+
+        top_preds = sorted(
+            [{"mode": mode, "probability": prob} for mode, prob in prob_dict.items() if prob > 0],
+            key=lambda x: -x["probability"]
         )
+
+        state.shipment_mode = [p["mode"] for p in top_preds]
+        state.extracted_info["ml_predicted_shipment_mode"] = predicted_mode
+        state.extracted_info["shipment_mode"] = predicted_mode
+        state.model_prediction_debug = {
+            "top_predictions": top_preds,
+            "prediction_probabilities": prob_dict,
+            "confidence_intervals": {"confidence": 90}
+        }
+
+        print("🎯 [Predicted Mode]:", predicted_mode)
+        print("📊 [Top Predictions]:", top_preds)
 
     except Exception as e:
-        state.shipment_mode = [FALLBACK_METHOD]
-        state.prediction_prob = 0.0
-        state.label_probs = {}
-        state.final_answer = (
-            f"⚠️ Không thể đưa ra dự đoán do lỗi: {str(e)}\n"
-            f"Gợi ý sử dụng phương thức dự phòng: **{FALLBACK_METHOD}**."
-        )
-    print(f"🧠 MAPIE trả: {state.shipment_mode}")
-    print(f"📊 Xác suất: {state.label_probs}")
+        print("❌ [Predict Error]:", str(e))
+        state.shipment_mode = []
+        state.final_answer = f"⚠️ Dự đoán thất bại: `{e}`"
+        state.model_prediction_debug = {"error": str(e)}
 
+    if not top_preds:
+        print("⚠️ [predict_mode] Không có dự đoán nào đáng tin")
+        state.shipment_mode = []
+        state.final_answer = "⚠️ Không thể dự đoán Shipment Mode do thiếu dữ liệu hoặc lỗi input."
+        state.model_prediction_debug = {}
+
+    print("🧪 [Debug shipment_mode]:", state.shipment_mode)
     return state

@@ -1,54 +1,96 @@
-# extract_info.py
-import re
-from langchain_core.runnables import RunnableLambda
+import os
+import json
+from openai import OpenAI
+from dotenv import load_dotenv
 from chatstate import ChatState
 
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Các field chuẩn có trong ChatState
+REQUIRED_FIELDS = [
+    "project_code",
+    "country",
+    "vendor",
+    "freight_cost",
+    "weight",
+    "pack_price",
+    "days_to_deliver",
+    "pq_date",
+]
+
+PROMPT_TEMPLATE = """
+You are a smart logistics assistant. Extract the following fields from the input text and return valid JSON:
+
+Fields:
+- project_code
+- country
+- vendor
+- freight_cost
+- weight
+- pack_price
+- days_to_deliver
+- pq_date
+
+Instructions:
+- If any field is not mentioned, return null.
+- Normalize field names to lowercase and use snake_case.
+- For "deliver in 5 days", extract days_to_deliver = 5
+- Ensure the output is strict valid JSON without any extra text.
+
+Text:
+\"\"\"{user_input}\"\"\"
+"""
+
 def extract_info(state: ChatState) -> ChatState:
-    print("▶ [extract_info_node] Đang xử lý trích xuất thông tin...")
-    text = state.input_text.lower()
-    info = {}
+    print("▶ [extract_info_node] Đang dùng GPT để bóc tách thông tin...")
 
-    # 🧠 Helper: extract string sau từ khóa
-    def extract_text_after(keyword, text):
-        match = re.search(rf"{keyword}\s*:?[\s]*([\w\s\-,]+)", text)
-        return match.group(1).strip().title() if match else None
+    user_input = state.input_text.strip()
+    if not user_input:
+        state.extracted_info = {field: None for field in REQUIRED_FIELDS}
+        state.extracted_info["raw_input"] = ""
+        state.extracted_info["input_valid"] = False
+        state.final_answer = "⚠️ Input đang trống, không thể trích xuất thông tin vận chuyển."
+        return state
 
-    # 🧠 Helper: extract float từ các từ khóa liên quan
-    def extract_float(keywords, text):
-        for key in keywords:
-            match = re.search(rf"{key}\s*:?[\s$]*([\d\.]+)", text)
-            if match:
-                return float(match.group(1))
-        return None
+    try:
+        prompt = PROMPT_TEMPLATE.format(user_input=user_input)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        content = response.choices[0].message.content.strip()
 
-    # 🧠 Helper: extract int
-    def extract_int(keywords, text):
-        for key in keywords:
-            match = re.search(rf"{key}\s*:?[\s]*([\d]+)", text)
-            if match:
-                return int(match.group(1))
-        return None
+        # Remove markdown if any
+        if content.startswith("```"):
+            content = "\n".join(
+                line for line in content.splitlines() if not line.strip().startswith("```")
+            ).strip()
 
-    # 🧠 Helper: extract date
-    def extract_date(text):
-        match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-        return match.group(1) if match else None
+        extracted_raw = json.loads(content)
 
-    # 📦 Trích thông tin đầu vào
-    info["origin_country"] = extract_text_after(r"(from|từ)", text)
-    info["destination_country"] = extract_text_after(r"(to|đến|tới)", text)
+        # Chuẩn hóa và đảm bảo không field nào bị thiếu
+        extracted_info = {}
+        for field in REQUIRED_FIELDS:
+            extracted_info[field] = extracted_raw.get(field, None)
 
-    info["weight"] = extract_float(["weight", "nặng", "trọng lượng"], text)
-    info["pack_price"] = extract_float(["pack price", "giá mỗi pack", "giá"], text)
-    info["freight_cost"] = extract_float(["freight", "vận chuyển", "shipping", "phí"], text)
+        # Thêm các field đặc biệt
+        extracted_info["raw_input"] = user_input
+        extracted_info["input_valid"] = True
 
-    info["project_code"] = extract_int(["project", "mã dự án"], text)
+        state.extracted_info = extracted_info
+        print("✅ [Extracted Info]:", json.dumps(extracted_info, indent=2))
 
-    info["vendor"] = extract_text_after("vendor", text)
-    info["pq_date"] = extract_date(text)
+    except Exception as e:
+        print("❌ [Extract Error]:", str(e))
+        state.extracted_info = {field: None for field in REQUIRED_FIELDS}
+        state.extracted_info["raw_input"] = user_input
+        state.extracted_info["input_valid"] = False
+        state.final_answer = (
+            "⚠️ Không trích xuất được thông tin từ input. "
+            "Vui lòng nhập rõ ràng hơn hoặc thử lại sau."
+        )
+        state.error = f"[extract_info_node] {str(e)}"
 
-    # ✅ Gán vào state
-    state.extracted_info = info
     return state
-
-extract_info_node: RunnableLambda = RunnableLambda(extract_info)
